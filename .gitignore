@@ -15,6 +15,7 @@ venv/
 .ruff_cache/
 
 # Data / state
+state/
 *.db
 *.db-journal
 *.sqlite

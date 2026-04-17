@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Protocol
 
 import pandas as pd
@@ -15,9 +15,9 @@ class Strategy(Protocol):
 
 @dataclass
 class Signal:
-    action: str  # "open_long" | "close" | "hold"
+    action: str  # "open_long" | "open_short" | "close" | "hold"
     stop_price: float = 0.0
-    size_usd: float = 0.0  # required for open_long; harness passes current equity to signal()
+    size_usd: float = 0.0  # required for open_long / open_short
 
 
 @dataclass
@@ -27,6 +27,7 @@ class Position:
     entry_time: pd.Timestamp
     size_usd: float
     stop_price: float
+    side: str = "long"  # "long" | "short"
 
 
 @dataclass
@@ -38,22 +39,24 @@ class Trade:
     exit_price: float
     size_usd: float
     pnl_usd: float  # net of round-trip transaction costs
-    exit_reason: str  # "stop" | "signal" | "circuit_breaker" | "end_of_backtest"
+    exit_reason: str  # "stop" | "flip" | "signal" | "circuit_breaker" | "end_of_backtest"
+    side: str = "long"  # "long" | "short"
 
 
 @dataclass
 class BacktestResult:
-    equity_curve: pd.Series  # total equity (cash + mark-to-market) indexed by timestamp
+    equity_curve: pd.Series  # total equity indexed by timestamp
     trades: list[Trade]
     initial_equity: float
 
 
 class BacktestHarness:
-    """Event-driven backtest engine.
+    """Event-driven backtest engine supporting long and short positions.
 
-    Iterates chronologically over *data*, calling *strategy*.signal() each bar.
     Signals generated at bar T execute at bar T+1 open (avoids lookahead).
-    Intraday stops are checked against each bar's low.
+    Long stops are checked against the bar's low; short stops against the bar's high.
+    Flipping (long → short or short → long) closes the existing position at the
+    same bar's open before entering the new one.
     """
 
     def __init__(
@@ -117,21 +120,34 @@ class BacktestHarness:
                     continue
                 bar = df.loc[t]
                 op = float(bar["open"])
+                hi = float(bar["high"])
                 lo = float(bar["low"])
                 cl = float(bar["close"])
 
                 # 1. Execute pending signal from previous bar (at today's open)
                 if coin in pending:
                     sig = pending.pop(coin)
-                    if sig.action == "open_long" and coin not in positions and not cb:
-                        cash -= sig.size_usd * (1 + self.cost)
-                        positions[coin] = Position(coin, op, t, sig.size_usd, sig.stop_price)
+                    if sig.action in ("open_long", "open_short") and not cb:
+                        new_side = "long" if sig.action == "open_long" else "short"
+                        # Flip: close opposite position first
+                        if coin in positions and positions[coin].side != new_side:
+                            cash += self._close(coin, op, t, "flip", positions, trades)
+                        # Open if not already in this direction
+                        if coin not in positions:
+                            cash -= sig.size_usd * (1 + self.cost)
+                            positions[coin] = Position(coin, op, t, sig.size_usd, sig.stop_price, new_side)
                     elif sig.action == "close" and coin in positions:
                         cash += self._close(coin, op, t, "signal", positions, trades)
 
-                # 2. Check stop hit: low crossed below trailing stop
-                if coin in positions and lo <= positions[coin].stop_price:
-                    cash += self._close(coin, positions[coin].stop_price, t, "stop", positions, trades)
+                # 2. Check stop hit: long → low crosses below stop; short → high crosses above stop
+                if coin in positions:
+                    pos = positions[coin]
+                    stop_hit = (
+                        (pos.side == "long" and lo <= pos.stop_price) or
+                        (pos.side == "short" and hi >= pos.stop_price)
+                    )
+                    if stop_hit:
+                        cash += self._close(coin, pos.stop_price, t, "stop", positions, trades)
 
                 # 3. Circuit breaker: close position and halt new signals
                 if cb and coin in positions:
@@ -139,11 +155,16 @@ class BacktestHarness:
                     pending.pop(coin, None)
                     continue
 
-                # 4. Generate signal for next bar; ratchet trailing stop upward
+                # 4. Generate signal for next bar; ratchet trailing stop in profitable direction
                 sig = self.strategy.signal(coin, t, eq)
-                if coin in positions and sig.stop_price > positions[coin].stop_price:
-                    positions[coin].stop_price = sig.stop_price
-                if sig.action in ("open_long", "close"):
+                if coin in positions:
+                    pos = positions[coin]
+                    if sig.stop_price > 0:
+                        if pos.side == "long" and sig.stop_price > pos.stop_price:
+                            pos.stop_price = sig.stop_price
+                        elif pos.side == "short" and sig.stop_price < pos.stop_price:
+                            pos.stop_price = sig.stop_price
+                if sig.action in ("open_long", "open_short", "close"):
                     pending[coin] = sig
 
             equity_curve[t] = self._mark_equity(cash, positions, t)
@@ -160,9 +181,14 @@ class BacktestHarness:
 
         return BacktestResult(pd.Series(equity_curve), trades, self.initial_equity)
 
+    def _return_mult(self, pos: Position, price: float) -> float:
+        """Position value relative to size_usd. Long: grows with price; short: grows as price falls."""
+        r = price / pos.entry_price
+        return r if pos.side == "long" else 2.0 - r
+
     def _mark_equity(self, cash: float, positions: dict[str, Position], t: pd.Timestamp) -> float:
         mark = sum(
-            pos.size_usd * float(self.data[c].loc[t, "close"]) / pos.entry_price
+            pos.size_usd * self._return_mult(pos, float(self.data[c].loc[t, "close"]))
             for c, pos in positions.items()
             if t in self.data[c].index
         )
@@ -179,7 +205,11 @@ class BacktestHarness:
     ) -> float:
         """Close position, record trade. Returns cash proceeds net of exit cost."""
         pos = positions.pop(coin)
-        proceeds = pos.size_usd * (price / pos.entry_price) * (1 - self.cost)
+        mult = self._return_mult(pos, price)
+        proceeds = pos.size_usd * mult * (1 - self.cost)
         pnl = proceeds - pos.size_usd * (1 + self.cost)
-        trades.append(Trade(coin, pos.entry_time, t, pos.entry_price, price, pos.size_usd, pnl, reason))
+        trades.append(Trade(
+            coin, pos.entry_time, t, pos.entry_price, price,
+            pos.size_usd, pnl, reason, pos.side,
+        ))
         return proceeds

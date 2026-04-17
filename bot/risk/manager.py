@@ -23,6 +23,13 @@ def chandelier_stop(
     return high.rolling(periods, min_periods=periods).max() - mult * atr_series
 
 
+def chandelier_stop_short(
+    low: pd.Series, atr_series: pd.Series, periods: int = 22, mult: float = 3.0
+) -> pd.Series:
+    """Short trailing stop: rolling lowest-low over *periods* plus *mult* × ATR."""
+    return low.rolling(periods, min_periods=periods).min() + mult * atr_series
+
+
 def position_size_usd(
     atr_val: float,
     price: float,
