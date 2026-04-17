@@ -23,9 +23,14 @@ from pathlib import Path
 
 import pandas as pd
 
+from dotenv import load_dotenv
+
 from bot.data.historical import load_candles
 from bot.risk.manager import atr, chandelier_stop, chandelier_stop_short, position_size_usd
 from bot.strategies.donchian_atr import DonchianATR
+from bot.live.notifier import notify_trade_open, notify_trade_close, notify_summary
+
+load_dotenv(override=True)
 
 COINS = ["BTC", "ETH", "SOL"]
 INTERVAL = "4h"
@@ -95,6 +100,7 @@ def _close_position(
         "exit_reason": reason,
     })
     print(f"  CLOSED {coin} {pos['side'].upper()} @ {exit_price:.2f}  pnl={pnl:+.2f}  reason={reason}")
+    notify_trade_close(coin, pos["side"], pos["entry_price"], exit_price, pnl, reason)
 
 
 def _open_position(
@@ -116,6 +122,7 @@ def _open_position(
         "entry_time": entry_time,
     }
     print(f"  OPEN  {coin} {side.upper()} @ {open_price:.2f}  stop={stop_price:.2f}  size=${size_usd:.2f}")
+    notify_trade_open(coin, side, open_price, stop_price, size_usd)
 
 
 class PaperTrader:
@@ -270,3 +277,5 @@ class PaperTrader:
 
         if state["pending"]:
             print("  Pending (next bar):", {k: v["action"] for k, v in state["pending"].items()})
+
+        notify_summary(total_eq, INITIAL_EQUITY, n_trades, state["positions"])
