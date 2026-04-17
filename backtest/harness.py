@@ -10,14 +10,14 @@ from bot.risk.manager import circuit_breaker_hit
 
 class Strategy(Protocol):
     def setup(self, data: dict[str, pd.DataFrame]) -> None: ...
-    def signal(self, coin: str, t: pd.Timestamp) -> "Signal": ...
+    def signal(self, coin: str, t: pd.Timestamp, equity: float) -> "Signal": ...
 
 
 @dataclass
 class Signal:
     action: str  # "open_long" | "close" | "hold"
     stop_price: float = 0.0
-    size_usd: float = 0.0  # required for open_long
+    size_usd: float = 0.0  # required for open_long; harness passes current equity to signal()
 
 
 @dataclass
@@ -140,7 +140,7 @@ class BacktestHarness:
                     continue
 
                 # 4. Generate signal for next bar; ratchet trailing stop upward
-                sig = self.strategy.signal(coin, t)
+                sig = self.strategy.signal(coin, t, eq)
                 if coin in positions and sig.stop_price > positions[coin].stop_price:
                     positions[coin].stop_price = sig.stop_price
                 if sig.action in ("open_long", "close"):
