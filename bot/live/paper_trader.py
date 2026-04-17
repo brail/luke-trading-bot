@@ -159,12 +159,19 @@ class PaperTrader:
         if not closed_times:
             print("  No closed bars available yet.")
             return
-        current_t = closed_times[-1]
-        current_t_str = str(current_t)
 
-        if state["last_bar_time"] == current_t_str:
-            print(f"  Already processed bar {current_t.date()} {current_t.time()} — nothing to do.")
+        # Process the oldest unprocessed closed bar (catches up if cron fired late)
+        last_processed = (
+            pd.Timestamp(state["last_bar_time"])
+            if state["last_bar_time"]
+            else pd.Timestamp.min.tz_localize("UTC")
+        )
+        unprocessed = [t for t in closed_times if t > last_processed]
+        if not unprocessed:
+            print(f"  Already up to date (last: {last_processed.strftime('%H:%M UTC')}) — nothing to do.")
             return
+        current_t = unprocessed[0]  # oldest unprocessed first; next runs catch the rest
+        current_t_str = str(current_t)
 
         print(f"  Processing bar: {current_t}")
 
