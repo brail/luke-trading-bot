@@ -150,13 +150,16 @@ class PaperTrader:
 
         self.strategy.setup(data)
 
-        # Current bar = last completed bar in fetched data
-        # (last index entry across all coins, as a common reference)
+        # Current bar = last CLOSED bar (bar opens at T, closes at T+4h)
+        # Discard bars that haven't closed yet to avoid lookahead on incomplete data
+        bar_duration = pd.Timedelta(hours=4)
+        now_ts = pd.Timestamp(now)
         all_times = sorted(set().union(*[set(df.index) for df in data.values()]))
-        if not all_times:
-            print("  ERROR: empty data.")
+        closed_times = [t for t in all_times if t + bar_duration <= now_ts]
+        if not closed_times:
+            print("  No closed bars available yet.")
             return
-        current_t = all_times[-1]
+        current_t = closed_times[-1]
         current_t_str = str(current_t)
 
         if state["last_bar_time"] == current_t_str:
